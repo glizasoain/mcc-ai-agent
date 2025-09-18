@@ -1,0 +1,39 @@
+pipelines:
+  branches:
+    main:
+      - step:
+          name: lint
+          image: python:3.11
+          script:
+            - pip install -r requirements.txt
+            - make lint
+      - step:
+          name: test
+          services: [docker]
+          script:
+            - pip install -r requirements.txt
+            - make test
+      - step:
+          name: build
+          services: [docker]
+          script:
+            - make build
+            - make push
+      - step:
+          name: infra:plan
+          trigger: manual
+          script:
+            - cd infra/terraform/environments/dev
+            - terraform init -input=false
+            - terraform plan -input=false -out=plan.out
+      - step:
+          name: infra:apply
+          trigger: manual
+          script:
+            - cd infra/terraform/environments/dev
+            - terraform apply -input=false plan.out
+      - step:
+          name: deploy
+          trigger: manual
+          script:
+            - make deploy ENV=dev

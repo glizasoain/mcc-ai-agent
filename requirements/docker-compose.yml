@@ -1,0 +1,22 @@
+
+version: '3.9'
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_SECURITY_DISABLED=true
+    ports: ["9200:9200"]
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-01-05T00-00-00Z
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=minio123
+    command: server /data --console-address :9001
+    ports: ["9000:9000","9001:9001"]
+  mysql:
+    image: mysql:8
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=data_engineering
+    ports: ["3306:3306"]

@@ -1,0 +1,3 @@
+region = "us-east-1"
+env    = "dev"
+# egress_allowlist = ["example.com", "*.trusted.com"]

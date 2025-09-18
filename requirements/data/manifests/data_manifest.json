@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "datasets": [
+    {
+      "name": "mcc_catalogs",
+      "path": "data/catalogs/*.csv",
+      "source": "curated network catalogs",
+      "refresh": "monthly",
+      "owner": "Risk/Admin"
+    },
+    {
+      "name": "merchants_sample",
+      "path": "data/samples/merchants.sample.csv",
+      "source": "synthetic",
+      "refresh": "on change",
+      "owner": "Eng"
+    },
+    {
+      "name": "kpis_sample",
+      "path": "data/samples/merchant_kpis_monthly.sample.csv",
+      "source": "synthetic",
+      "refresh": "on change",
+      "owner": "Eng"
+    },
+    {
+      "name": "gold_set_sample",
+      "path": "data/samples/gold_set.sample.csv",
+      "source": "underwriting",
+      "refresh": "monthly",
+      "owner": "Underwriting"
+    }
+  ]
+}
