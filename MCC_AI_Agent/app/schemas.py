@@ -33,6 +33,7 @@ class Provenance(BaseModel):
 	model: Optional[str] = None
 	prompt_hash: Optional[str] = None
 	mcc_reference_version: Optional[str] = None
+	llm_model: Optional[str] = None
 
 
 class RecommendResponse(BaseModel):

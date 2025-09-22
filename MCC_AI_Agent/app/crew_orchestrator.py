@@ -1,4 +1,5 @@
 from typing import Optional, Dict, Any, List
+import os
 
 import time
 import json
@@ -78,6 +79,7 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 		f"website: {website_url or ''}\n"
 		f"websites: {', '.join(all_sites)}\n"
 		f"merchant_description: {merchant_description or ''}\n"
+		f"website_summary: {prof.get('website_summary')}\n"
 		f"business_registration_name: {business_registration_name or ''}\n"
 		f"industry: {prof.get('industry')}\n"
 		f"vertical: {prof.get('vertical')}\n"
@@ -202,6 +204,15 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			parsed["prompt_hash"] = combined_hash
 			parsed["_debug_prompt"] = prompt
 			parsed["_agents"] = ["MCC Classification Analyst", "MCC Review Analyst"]
+			# Try to surface underlying LLM model if available on agents (best-effort)
+			try:
+				llm_model = getattr(getattr(classifier, "llm", None), "model_name", None) or getattr(getattr(reviewer, "llm", None), "model_name", None)
+				if not llm_model:
+					llm_model = os.getenv("OPENAI_MODEL")
+				if llm_model:
+					parsed["llm_model"] = llm_model
+			except Exception:
+				pass
 			return parsed
 		except Exception as e:
 			last_err = e

@@ -1,6 +1,8 @@
 import csv
 from pathlib import Path
 from typing import Optional, Dict
+import httpx
+from bs4 import BeautifulSoup
 
 
 _PORTFOLIO_CACHE: Dict[str, dict] = {}
@@ -107,5 +109,28 @@ def simulate_impact(mcc_from: str, mcc_to: str, cohort_size: int = 1000) -> dict
 	result["summary"] = ", ".join(summary_bits) if summary_bits else "no_data"
 
 	return result
+
+
+def fetch_and_summarize(url: str, timeout: float = 5.0) -> Dict[str, str]:
+	"""Fetch a single URL and return {'content': text, 'summary': summary}.
+
+	No fabrication: if fetch fails, fields are empty strings.
+	"""
+	text = ""
+	summary = ""
+	try:
+		with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+			r = client.get(url)
+			if r.status_code >= 200 and r.status_code < 300:
+				soup = BeautifulSoup(r.text, "lxml")
+				# Drop script/style
+				for tag in soup(["script", "style", "noscript"]):
+					tag.extract()
+				text = " ".join((soup.get_text(separator=" ") or "").split())
+				# Simple heuristic summary: first 400 chars
+				summary = text[:400]
+	except Exception:
+		pass
+	return {"content": text, "summary": summary}
 
 

@@ -20,6 +20,8 @@ from app.db import (
 from app.llm import call_llm_for_mcc
 from app.crew_orchestrator import run_mcc_recommendation
 from app.impact import simulate_impact as simulate_impact_calc
+from app.impact import fetch_and_summarize
+from app.web import crawl_and_summarize
 
 # Load .env if present
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
@@ -61,7 +63,11 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		if not val:
 			return None
 		if isinstance(val, str):
-			return val
+			s = val.strip()
+			# Prefix scheme if missing
+			if not s.startswith("http://") and not s.startswith("https://"):
+				s = "https://" + s
+			return s
 		return getattr(val, "url", None)
 
 	website_url = (to_url(req.website) if req.website else None) or ""
@@ -111,8 +117,23 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		# Prefer list if provided; also pass primary website
 		primary = all_websites[0] if all_websites else website_url
 		# Include business registration name from DB if present
-		biz_name = (get_merchant(req.merchant_id) or {}).get("legal_name")
-		crew = run_mcc_recommendation(req.merchant_id, primary, prof, req.merchant_description, all_websites, biz_name)
+		mer_info = (get_merchant(req.merchant_id) or {})
+		biz_name = mer_info.get("legal_name")
+		# Fetch website summary: try focused crawl first, then single-page fallback
+		website_summary = ""
+		if primary:
+			try:
+				overall, pages = crawl_and_summarize(primary, depth=2, max_pages=25, total_budget_seconds=6.0)
+				website_summary = overall or ""
+				if not website_summary:
+					ws = fetch_and_summarize(primary)
+					website_summary = ws.get("summary") or ""
+			except Exception:
+				website_summary = ""
+		# Add website_summary into profile context for prompt
+		prof_with_summary = dict(prof)
+		prof_with_summary["website_summary"] = website_summary
+		crew = run_mcc_recommendation(req.merchant_id, primary, prof_with_summary, req.merchant_description, all_websites, biz_name)
 		merchant_name = crew.get("merchant_name") or merchant_name
 		rec_mcc = crew.get("recommended_mcc") or rec_mcc
 		confidence = int(crew.get("confidence") or confidence)
@@ -121,6 +142,7 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		needs_review = confidence < 80
 		model_name = crew.get("model") or "crewai"
 		prompt_hash_val = crew.get("prompt_hash")
+		llm_model_name = crew.get("llm_model")
 	except Exception as e:
 		raise HTTPException(status_code=503, detail={"error": "CREW_UNAVAILABLE", "message": str(e)})
 
@@ -141,10 +163,10 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		recommendation_justification=rec_justification,
 		supporting_evidence=supporting,
 		needs_review=needs_review,
-		website_summary="",  # placeholder; future: summarize fetched content
+		website_summary=prof_with_summary.get("website_summary") or "",
 		debug_prompt=crew.get("_debug_prompt"),
 		agents_involved=crew.get("_agents") or [],
-		provenance=Provenance(model=locals().get("model_name"), prompt_hash=locals().get("prompt_hash_val"), mcc_reference_version="catalog:mcc_codes_full.csv"),
+		provenance=Provenance(model=locals().get("model_name"), prompt_hash=locals().get("prompt_hash_val"), mcc_reference_version="catalog:mcc_codes_full.csv", llm_model=locals().get("llm_model_name")),
 	)
 	data = resp.model_dump()
 
