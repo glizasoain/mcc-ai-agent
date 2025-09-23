@@ -81,6 +81,7 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 		f"merchant_description: {merchant_description or ''}\n"
 		f"website_summary: {prof.get('website_summary')}\n"
 		f"business_registration_name: {business_registration_name or ''}\n"
+		f"current_mcc: {prof.get('current_mcc')}\n"
 		f"industry: {prof.get('industry')}\n"
 		f"vertical: {prof.get('vertical')}\n"
 		f"country: {prof.get('country')}\n"

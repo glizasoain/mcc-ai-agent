@@ -133,6 +133,8 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		# Add website_summary into profile context for prompt
 		prof_with_summary = dict(prof)
 		prof_with_summary["website_summary"] = website_summary
+		if req.current_mcc:
+			prof_with_summary["current_mcc"] = req.current_mcc
 		crew = run_mcc_recommendation(req.merchant_id, primary, prof_with_summary, req.merchant_description, all_websites, biz_name)
 		merchant_name = crew.get("merchant_name") or merchant_name
 		rec_mcc = crew.get("recommended_mcc") or rec_mcc
