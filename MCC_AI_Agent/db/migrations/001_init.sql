@@ -51,6 +51,44 @@ CREATE TABLE IF NOT EXISTS artifacts (
   PRIMARY KEY (run_id, kind)
 );
 
+-- Web intelligence (Phase 6)
+CREATE TABLE IF NOT EXISTS web_pages (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  merchant_id VARCHAR(32) NOT NULL,
+  url VARCHAR(1024) NOT NULL,
+  title VARCHAR(512),
+  summary TEXT,
+  content MEDIUMTEXT,
+  content_hash CHAR(64),
+  crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  -- Use a prefix length on url to keep composite index under 3072-byte InnoDB limit
+  UNIQUE KEY uniq_merchant_url (merchant_id, url(255))
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  merchant_id VARCHAR(32) NOT NULL,
+  page_id BIGINT NOT NULL,
+  chunk_index INT NOT NULL,
+  model VARCHAR(64) NOT NULL,
+  dim INT NOT NULL,
+  vector_json JSON NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_page_chunk (page_id, chunk_index),
+  INDEX idx_merchant (merchant_id)
+);
+
+-- MCC catalog embeddings (dev/local for RAG)
+CREATE TABLE IF NOT EXISTS mcc_embeddings (
+  mcc_code VARCHAR(10) PRIMARY KEY,
+  model VARCHAR(64) NOT NULL,
+  dim INT NOT NULL,
+  vector_json JSON NOT NULL,
+  text LONGTEXT NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_model (model)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   idempotency_key VARCHAR(64) PRIMARY KEY,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -58,4 +96,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   response_json JSON,
   ttl_at TIMESTAMP,
   INDEX (ttl_at)
+);
+
+-- Brand overrides for deterministic MCC mapping
+CREATE TABLE IF NOT EXISTS brand_mcc_overrides (
+  brand_key VARCHAR(64) PRIMARY KEY, -- e.g., 'united', 'delta'
+  domain_pattern VARCHAR(255) NOT NULL, -- e.g., 'united.com'
+  mcc_code VARCHAR(10) NOT NULL,
+  notes VARCHAR(255),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );

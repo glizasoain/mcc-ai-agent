@@ -6,6 +6,11 @@ import json
 import re
 import hashlib
 from crewai import Agent, Task, Crew
+from urllib.parse import urlparse
+from app.db import get_mcc_description, get_brand_override, list_all_mcc_codes
+from app.rag import ensure_mcc_embeddings_built, retrieve_mcc_candidates
+from app.signals import compute_signals, infer_brand
+from app.db import load_brand_registry
 
 
 # Simple circuit breaker
@@ -38,7 +43,60 @@ def _cb_record_success():
 
 
 
-def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile: Optional[Dict[str, Any]] = None, merchant_description: Optional[str] = None, website_urls: Optional[List[str]] = None, business_registration_name: Optional[str] = None) -> Dict[str, Any]:
+def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile: Optional[Dict[str, Any]] = None, merchant_description: Optional[str] = None, website_urls: Optional[List[str]] = None, business_registration_name: Optional[str] = None, web_pages: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+	# Deterministic brand-specific MCC overrides (example list; extend as needed)
+	BRAND_MCC_OVERRIDES: Dict[str, str] = {
+		"united": "3000",
+		# "delta": "3001",
+		# "american": "3002",
+	}
+	# Web Intelligence Analyst: produce structured evidence JSON
+	intel_analyst = Agent(
+		role="Web Intelligence Analyst",
+		goal=(
+			"Extract MCC-relevant facts from provided website context and underwriter inputs, "
+			"returning STRICT JSON with fields: core_offering, primary_revenue_stream, target_customers, "
+			"sales_model, transaction_flow, pricing_model, regulated_keywords, compliance_indicators, "
+			"verticals, integrations, excluded_lines, key_pages, evidence."
+		),
+		backstory=(
+			"You analyze merchant websites to identify their core revenue-generating activity. "
+			"You never fabricate. Cite short quotes with URLs when possible."
+		),
+		allow_delegation=False,
+		verbose=False,
+	)
+
+	# Candidate Selector agent
+	selector = Agent(
+		role="Candidate Selector",
+		goal=(
+			"Given web intelligence, signals, and a pool of candidate MCC codes with descriptions, "
+			"return a ranked shortlist (5-10) with scores (0-100), per-candidate reasoning, and citations."
+		),
+		backstory=(
+			"You specialize in narrowing down MCC options. You DO NOT invent new codes. "
+			"You only score and explain candidates provided to you."
+		),
+		allow_delegation=False,
+		verbose=False,
+	)
+
+	# Decision agent
+	decision = Agent(
+		role="MCC Decision Analyst",
+		goal=(
+			"Choose exactly one MCC from a provided shortlist. Output strict JSON with merchant_name, "
+			"recommended_mcc (4 digits), confidence (0-100), justification."
+		),
+		backstory=(
+			"You decide the final MCC from a shortlist. You MUST pick from the shortlist only. "
+			"You must justify why the chosen MCC fits and why the runner-up does not, citing URLs."
+		),
+		allow_delegation=False,
+		verbose=False,
+	)
+
 	classifier = Agent(
 		role="MCC Classification Analyst",
 		goal="Classify the correct Merchant Category Code (MCC) for the given merchant.",
@@ -64,16 +122,47 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 
 	prof = profile or {}
 	all_sites = website_urls or []
+
+	# Prepare concise web pages context for the intel agent
+	pages_ctx: List[Dict[str, str]] = []
+	if web_pages:
+		for p in web_pages[:8]:
+			pages_ctx.append({
+				"url": str(p.get("url") or ""),
+				"title": str(p.get("title") or ""),
+				"text": str(p.get("text") or "")[:1200],
+			})
+
+	intel_prompt = (
+		"Analyze the following merchant context and website content to extract MCC-relevant facts.\n"
+		"Return STRICT JSON ONLY with keys: core_offering, primary_revenue_stream, target_customers, "
+		"sales_model, transaction_flow, pricing_model, regulated_keywords, compliance_indicators, verticals, "
+		"integrations, excluded_lines, is_first_party_airline, is_travel_agency, key_pages (array of {url,title}), "
+		"evidence (array of {quote,url}).\n\n"
+		"Context:\n"
+		f"merchant_id: {merchant_id}\n"
+		f"websites: {', '.join(all_sites)}\n"
+		f"merchant_description: {merchant_description or ''}\n"
+		f"business_registration_name: {business_registration_name or ''}\n"
+		f"legal_name: {business_registration_name or ''}\n"
+		f"industry: {prof.get('industry')}\n"
+		f"vertical: {prof.get('vertical')}\n"
+		f"country: {prof.get('country')}\n"
+		f"website_summary: {prof.get('website_summary')}\n"
+		f"pages: {json.dumps(pages_ctx)}\n"
+		"Respond ONLY with the JSON object."
+	)
+
 	prompt = (
 		"You are a Merchant Category Code (MCC) compliance expert.\n"
 		"MCCs are 4-digit codes used by card networks to categorize a merchant's PRIMARY business activity for authorization, "
 		"interchange, risk, and reporting. Always choose the MCC that reflects the merchant's core revenue-generating activity (not ancillary services).\n\n"
 		"Instructions:\n"
 		"- Return STRICT JSON only with keys: merchant_name, recommended_mcc (4 digits), confidence (0-100), justification.\n"
-		"- Use the context below (industry, vertical, country, business registration, websites, existing_mcc, ticket/volume).\n"
+		"- Use the context below (industry, vertical, country, business registration, websites, current_mcc, ticket/volume).\n"
 		"- If uncertain, lower confidence and state which evidence is missing.\n\n"
 		"Heuristics: SaaS/Software → 7372/7375; E-commerce retail → 5999/5732; Professional services → 7392/7399; "
-		"Healthcare → 8011/8021/8099; Travel → 4722; Utilities → 4900.\n\n"
+		"Healthcare → 8011/8021/8099; Travel agency → 4722; Airline (first-party) → 4511; Utilities → 4900.\n\n"
 		"Context:\n"
 		f"merchant_id: {merchant_id}\n"
 		f"website: {website_url or ''}\n"
@@ -85,12 +174,23 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 		f"industry: {prof.get('industry')}\n"
 		f"vertical: {prof.get('vertical')}\n"
 		f"country: {prof.get('country')}\n"
-		f"existing_mcc: {prof.get('existing_mcc')}\n"
 		f"avg_ticket: {prof.get('avg_ticket')}\n"
 		f"volume_band: {prof.get('volume_band')}\n"
+		f"web_intel: will be provided separately as JSON\n"
 		"Respond ONLY in JSON with keys: merchant_name, recommended_mcc, confidence, justification."
 	)
 	prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+	# Step 0: Web Intelligence task
+	intel_task = Task(
+		description=intel_prompt,
+		expected_output=(
+			"Strict JSON with keys: core_offering, primary_revenue_stream, target_customers, sales_model, "
+			"transaction_flow, pricing_model, regulated_keywords, compliance_indicators, verticals, integrations, "
+			"excluded_lines, key_pages, evidence."
+		),
+		agent=intel_analyst,
+	)
 
 	classify_task = Task(
 		description=prompt,
@@ -101,7 +201,7 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 		agent=classifier,
 	)
 
-	classify_crew = Crew(agents=[classifier], tasks=[classify_task])
+	# We'll run the intelligence task first to capture its JSON, then run classification using it
 
 	def normalize_and_validate(text: str) -> Dict[str, Any]:
 		def parse_conf(val) -> int:
@@ -158,10 +258,206 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 	last_err: Optional[Exception] = None
 	for attempt in range(3):
 		try:
-			# Step 1: Classification
-			result_cls = classify_crew.kickoff()
-			text_cls: str = getattr(result_cls, "raw", None) or getattr(result_cls, "output", None) or str(result_cls)
-			parsed = normalize_and_validate(text_cls)
+			# Step 0: Run Web Intelligence first and capture JSON
+			intel_crew = Crew(agents=[intel_analyst], tasks=[intel_task])
+			res_intel = intel_crew.kickoff()
+			intel_text: str = getattr(res_intel, "raw", None) or getattr(res_intel, "output", None) or str(res_intel)
+			intel_json_for_debug = None
+			try:
+				start_i = intel_text.find("{")
+				end_i = intel_text.rfind("}")
+				intel_json_for_debug = intel_text[start_i:end_i + 1] if start_i != -1 and end_i != -1 else "{}"
+			except Exception:
+				intel_json_for_debug = "{}"
+
+			# Deterministic airline vs agency disambiguator from intel JSON
+			rule_hint = ""
+			candidate_codes: List[str] = []
+			try:
+				intel_obj = json.loads(intel_json_for_debug or "{}")
+				is_airline = bool(intel_obj.get("is_first_party_airline"))
+				is_agency = bool(intel_obj.get("is_travel_agency"))
+				key_pages = intel_obj.get("key_pages") or []
+				evidence = intel_obj.get("evidence") or []
+				text_blobs = " ".join([str((e or {}).get("quote") or "") for e in evidence])
+				urls = " ".join([str((kp or {}).get("url") or "") for kp in key_pages])
+				airline_cues = 0
+				agency_cues = 0
+				for token in ["/book", "/check-in", "/checkin", "/manage", "/manage-booking", "/flight-status", "/baggage", "contract-of-carriage"]:
+					if token in urls.lower():
+						airline_cues += 1
+				for token in ["over ", " airlines", "multi-airline", "ota", "travel agency", "compare airlines", "iata"]:
+					if token in text_blobs.lower():
+						agency_cues += 1
+				if is_airline:
+					airline_cues += 2
+				if is_agency:
+					agency_cues += 2
+				# Brand override (e.g., united.com -> 3000)
+				brand_key = None
+				try:
+					if website_url:
+						pu = urlparse(website_url)
+						host = pu.netloc.lower()
+						labels = [lbl for lbl in host.split(".") if lbl and lbl != "www"]
+						if labels:
+							brand_key = labels[0]
+				except Exception:
+					brand_key = None
+				brand_code = get_brand_override(brand_key, host)
+				# Build candidate list
+				cset = []
+				if brand_code:
+					cset.append(brand_code)
+				# Airline/agency candidates
+				if airline_cues >= agency_cues:
+					if "4511" not in cset:
+						cset.append("4511")
+					if "4722" not in cset:
+						cset.append("4722")
+				else:
+					if "4722" not in cset:
+						cset.append("4722")
+					if "4511" not in cset:
+						cset.append("4511")
+				# Compute general signals and include in provenance later
+				signals = compute_signals(intel_obj)
+				# Infer brand from registry
+				brand_reg = load_brand_registry()
+				brand_infer = infer_brand(intel_obj, brand_reg, host)
+				brand_key_infer = brand_infer.get("brand_key")
+				brand_mcc_infer = brand_infer.get("brand_mcc")
+				brand_match_score = int(brand_infer.get("match_score") or 0)
+				# RAG retrieval: build a query from intel fields
+				try:
+					q_parts = []
+					for key in ("core_offering", "primary_revenue_stream", "sales_model", "transaction_flow", "verticals"):
+						val = intel_obj.get(key)
+						if isinstance(val, list):
+							q_parts.extend([str(v) for v in val])
+						elif val:
+							q_parts.append(str(val))
+					retrieval_query = "; ".join(q_parts) or (merchant_description or "")
+					ensure_mcc_embeddings_built()
+					rag_hits = retrieve_mcc_candidates(retrieval_query, top_k=7)
+					for code, _ in rag_hits:
+						if code not in cset:
+							cset.append(code)
+				except Exception:
+					pass
+				# If brand registry inference confident and first-party airline, boost it as a top candidate (no short-circuit)
+				if brand_mcc_infer and is_airline and brand_match_score >= 85:
+					if brand_code not in cset:
+						cset.insert(0, brand_mcc_infer)
+					# Add a rule hint but let the decision agent choose among candidates
+					rule_hint += (f"\nBrand candidate suggested: {brand_mcc_infer} for inferred brand '{brand_key_infer}' (score={brand_match_score}). When is_first_party_airline=true, prefer the brand-specific MCC over generic airline unless evidence shows otherwise.")
+
+				candidate_codes = cset
+				# Attach signals in debug output
+				parsed_signals_json = json.dumps(signals)
+				candidate = None
+				why_not = None
+				if airline_cues >= 2 and agency_cues == 0:
+					candidate = "4511"
+					why_not = "4722"
+				elif agency_cues >= 2 and airline_cues == 0:
+					candidate = "4722"
+					why_not = "4511"
+				elif airline_cues > agency_cues:
+					candidate = "4511"
+					why_not = "4722"
+				elif agency_cues > airline_cues:
+					candidate = "4722"
+					why_not = "4511"
+				if candidate:
+					rule_hint = (
+						f"Preliminary MCC by deterministic signals: {candidate}. "
+						f"Airline_cues={airline_cues}, agency_cues={agency_cues}. "
+						f"If you disagree, cite evidence and explain why not {candidate}. Also explain why not {why_not}."
+					)
+			except Exception:
+				pass
+
+			# Step 1: Candidate selection (ranked shortlist)
+			candidates_blob = "\n".join([f"- {code}: {get_mcc_description(code) or ''}" for code in (candidate_codes or [])]) if candidate_codes else ""
+			# If candidate set is too small (<3) or caller opts for full catalog mode via env, expand to full catalog for selector
+			full_catalog = (len(candidate_codes or []) < 3) or (os.getenv("MCC_FULL_CATALOG_MODE", "false").lower() in ("1","true","yes"))
+			if full_catalog:
+				all_codes = list_all_mcc_codes()
+				candidate_codes = [c for c, _ in all_codes]
+				candidates_blob = "\n".join([f"- {c}: {d}" for c, d in all_codes])
+
+			bypass_selector = (os.getenv("MCC_BYPASS_SELECTOR", "false").lower() in ("1","true","yes"))
+			shortlist: List[str] = []
+			if bypass_selector:
+				shortlist = candidate_codes or []
+			else:
+				selector_prompt = (
+					"You are the Candidate Selector. Score and shortlist MCC candidates.\n"
+					"Rules: Only use the provided candidate codes. Return STRICT JSON with keys: candidates (array of {code, score, why, evidence}), top_two (array of two codes).\n\n"
+					"Context:\n"
+					f"Web Intelligence JSON: {(intel_json_for_debug or '{}')}\n"
+					f"Signals: {json.dumps(signals)}\n"
+					f"Rule hints: {rule_hint}\n"
+					f"Merchant domain brand_key: {brand_key or ''}; brand_candidate: {brand_code or ''}\n"
+					f"Candidates (code: description):\n{candidates_blob}\n"
+				)
+				selector_task = Task(
+					description=selector_prompt,
+					expected_output=(
+						"Strict JSON with keys: candidates (array of {code, score, why, evidence}), top_two (array of two codes)."
+					),
+					agent=selector,
+				)
+				selector_crew = Crew(agents=[selector], tasks=[selector_task])
+				res_sel = selector_crew.kickoff()
+				text_sel: str = getattr(res_sel, "raw", None) or getattr(res_sel, "output", None) or str(res_sel)
+				# Parse selector output
+				try:
+					sel_obj = json.loads(text_sel[text_sel.find("{"):text_sel.rfind("}")+1])
+					cand_list = sel_obj.get("candidates") or []
+					# sort by score desc, keep top 10, and stay within candidate_codes
+					cand_list_sorted = sorted(
+						[c for c in cand_list if str(c.get("code") or "") in (candidate_codes or [])],
+						key=lambda c: int(c.get("score") or 0), reverse=True)
+					shortlist = [str(c.get("code")) for c in cand_list_sorted[:10]]
+				except Exception:
+					# fallback to original candidate_codes if parsing fails
+					shortlist = candidate_codes or []
+
+			# Step 2: Decision agent chooses exactly one from shortlist
+			decision_prompt = (
+				"You are the MCC Decision Analyst. Choose exactly one MCC from the shortlist.\n"
+				"Return STRICT JSON: { merchant_name, recommended_mcc (4-digit), confidence (0-100), justification }.\n"
+				"Constraints: You MUST choose from the shortlist ONLY. If the shortlist contains a brand-specific MCC matching the merchant's brand/domain and is_first_party_airline=true, prefer the brand-specific MCC over generic airline (e.g., 3000 United Airlines over 4511), unless specific evidence shows it is not the brand. Justify why chosen and why not the runner-up, citing URLs.\n\n"
+				f"Shortlist: {shortlist}\n"
+				f"Web Intelligence JSON: {(intel_json_for_debug or '{}')}\n"
+				f"Signals: {json.dumps(signals)}\n"
+				f"Rule hints: {rule_hint}\n"
+				f"Merchant domain brand_key: {brand_key or ''}; brand_candidate: {brand_code or ''}\n"
+				f"Candidates (code: description):\n{candidates_blob}\n"
+			)
+			decision_task = Task(
+				description=decision_prompt,
+				expected_output=(
+					"Strict JSON with keys: merchant_name (string), recommended_mcc (4-digit string), confidence (0-100 integer), justification (string)."
+				),
+				agent=decision,
+			)
+			decision_crew = Crew(agents=[decision], tasks=[decision_task])
+			res_dec = decision_crew.kickoff()
+			text_dec: str = getattr(res_dec, "raw", None) or getattr(res_dec, "output", None) or str(res_dec)
+			parsed = normalize_and_validate(text_dec)
+			# Enforce shortlist membership if provided
+			if shortlist and parsed.get("recommended_mcc") not in shortlist:
+				raise RuntimeError("Decision selected MCC outside shortlist")
+			# Post-rule guardrail: if first-party airline and high-confidence brand match exists, prefer brand MCC
+			try:
+				if is_airline and brand_mcc_infer and brand_match_score >= 85:
+					parsed["recommended_mcc"] = brand_mcc_infer
+					parsed["justification"] = (parsed.get("justification") or "") + f"\n[Preferred brand-specific MCC: {brand_mcc_infer} (brand_match_score={brand_match_score})]"
+			except Exception:
+				pass
 
 			# Step 2: Review & correction
 			review_prompt = (
@@ -174,7 +470,6 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 				f"industry: {prof.get('industry')}\n"
 				f"vertical: {prof.get('vertical')}\n"
 				f"country: {prof.get('country')}\n"
-				f"existing_mcc: {prof.get('existing_mcc')}\n"
 				f"avg_ticket: {prof.get('avg_ticket')}\n"
 				f"volume_band: {prof.get('volume_band')}\n"
 				f"draft_json: {json.dumps(parsed)}\n"
@@ -199,12 +494,31 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 				# keep original parsed if reviewer output invalid
 				pass
 
-			combined_hash = hashlib.sha256((prompt + "\n---\n" + review_prompt).encode("utf-8")).hexdigest()
+			combined_hash = hashlib.sha256((intel_prompt + "\n---\n" + prompt + "\n---\n" + review_prompt).encode("utf-8")).hexdigest()
 			_cb_record_success()
 			parsed["model"] = "crewai"
 			parsed["prompt_hash"] = combined_hash
 			parsed["_debug_prompt"] = prompt
-			parsed["_agents"] = ["MCC Classification Analyst", "MCC Review Analyst"]
+			parsed["_agents"] = ["Web Intelligence Analyst"] + ([] if bypass_selector else ["Candidate Selector"]) + ["MCC Decision Analyst", "MCC Review Analyst"]
+			try:
+				if 'parsed_signals_json' in locals():
+					parsed["_signals"] = json.loads(parsed_signals_json)
+			except Exception:
+				pass
+			if intel_json_for_debug:
+				try:
+					parsed["_web_intel_json"] = json.loads(intel_json_for_debug)
+				except Exception:
+					parsed["_web_intel_json"] = None
+			# Add brand inference to provenance
+			try:
+				parsed["_brand"] = {
+					"brand_key": brand_key_infer,
+					"brand_mcc": brand_mcc_infer,
+					"brand_match_score": brand_match_score,
+				}
+			except Exception:
+				pass
 			# Try to surface underlying LLM model if available on agents (best-effort)
 			try:
 				llm_model = getattr(getattr(classifier, "llm", None), "model_name", None) or getattr(getattr(reviewer, "llm", None), "model_name", None)

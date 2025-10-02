@@ -89,6 +89,41 @@ def init_database():
 	ensure_database_exists()
 	run_migrations()
 	seed_mcc_codes_from_requirements_csv()
+	# Seed brand_registry from CSV if empty
+	try:
+		conn = get_connection()
+		cur = conn.cursor()
+		cur.execute("SELECT COUNT(*) FROM brand_registry")
+		count = int((cur.fetchone() or [0])[0])
+		if count == 0:
+			csv_path = Path(__file__).resolve().parents[1] / "data" / "brand_registry.csv"
+			if csv_path.exists():
+				with csv_path.open("r", encoding="utf-8") as f:
+					import csv as _csv
+					reader = _csv.DictReader(f)
+					rows = []
+					for r in reader:
+						rows.append((
+							(r.get("brand_key") or "").strip(),
+							json.dumps([(n or "").strip() for n in (r.get("official_names") or "").split(";") if n.strip()]),
+							json.dumps([(a or "").strip() for a in (r.get("aliases") or "").split(";") if a.strip()]),
+							json.dumps([(d or "").strip() for d in (r.get("official_domains") or "").split(";") if d.strip()]),
+							json.dumps([(i or "").strip() for i in (r.get("iata_codes") or "").split(";") if i.strip()]),
+							(r.get("brand_mcc") or "").strip(),
+							(r.get("country") or None),
+							(r.get("network") or None),
+							(r.get("source_url") or None),
+						))
+					if rows:
+						cur.executemany(
+							"INSERT INTO brand_registry (brand_key, official_names, aliases, official_domains, iata_codes, brand_mcc, country, network, source_url) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+							" ON DUPLICATE KEY UPDATE official_names=VALUES(official_names), aliases=VALUES(aliases), official_domains=VALUES(official_domains), iata_codes=VALUES(iata_codes), brand_mcc=VALUES(brand_mcc), country=VALUES(country), network=VALUES(network), source_url=VALUES(source_url)",
+							rows,
+						)
+						conn.commit()
+		cur.close(); conn.close()
+	except Exception:
+		pass
 
 
 def get_connection(include_database: bool = True) -> mysql.connector.MySQLConnection:
@@ -110,6 +145,83 @@ def get_mcc_description(mcc_code: str) -> str:
 		return desc
 	except Exception:
 		return ""
+
+
+def list_all_mcc_codes() -> list[tuple[str, str]]:
+	"""Return list of (mcc_code, description)."""
+	try:
+		conn = get_connection()
+		cur = conn.cursor()
+		cur.execute("SELECT mcc_code, description FROM mcc_codes ORDER BY mcc_code")
+		rows = cur.fetchall() or []
+		cur.close(); conn.close()
+		result: list[tuple[str, str]] = []
+		for r in rows:
+			code = (r[0] or "").strip()
+			desc = (r[1] or "").strip()
+			if code:
+				result.append((code, desc))
+		return result
+	except Exception:
+		return []
+
+
+def load_brand_registry() -> list[dict]:
+	"""Load brand registry rows as dicts."""
+	try:
+		conn = get_connection()
+		cur = conn.cursor()
+		cur.execute("SELECT brand_key, official_names, aliases, official_domains, iata_codes, brand_mcc, country, network, source_url, last_verified_at FROM brand_registry")
+		rows = cur.fetchall() or []
+		cur.close(); conn.close()
+		result: list[dict] = []
+		for r in rows:
+			result.append({
+				"brand_key": r[0],
+				"official_names": json.loads(r[1] or "[]"),
+				"aliases": json.loads(r[2] or "[]"),
+				"official_domains": json.loads(r[3] or "[]"),
+				"iata_codes": json.loads(r[4] or "[]"),
+				"brand_mcc": (r[5] or "").strip(),
+				"country": r[6],
+				"network": r[7],
+				"source_url": r[8],
+				"last_verified_at": r[9].isoformat() if r[9] else None,
+			})
+		return result
+	except Exception:
+		return []
+
+
+def get_brand_override(brand_key: str | None, host: str | None) -> str | None:
+	"""Return MCC code override for a brand/domain if configured, else None.
+
+	Looks up by brand_key first; if not found, matches exact domain_pattern or suffix against host.
+	"""
+	try:
+		if not brand_key and not host:
+			return None
+		conn = get_connection()
+		cur = conn.cursor()
+		# Try brand_key
+		if brand_key:
+			cur.execute("SELECT mcc_code FROM brand_mcc_overrides WHERE brand_key=%s LIMIT 1", (brand_key,))
+			row = cur.fetchone()
+			if row and row[0]:
+				cur.close(); conn.close(); return str(row[0])
+		# Try domain_pattern exact or suffix match
+		if host:
+			cur.execute("SELECT mcc_code, domain_pattern FROM brand_mcc_overrides")
+			for code, pattern in cur.fetchall() or []:
+				p = (pattern or "").lower().strip()
+				if not p:
+					continue
+				if host.lower() == p or host.lower().endswith("." + p):
+					cur.close(); conn.close(); return str(code)
+		cur.close(); conn.close()
+		return None
+	except Exception:
+		return None
 
 
 # ------------------ Persistence helpers ------------------
@@ -199,13 +311,13 @@ def save_idempotent_response(idempotency_key: str, request_obj: dict, response_o
 	conn.commit(); cur.close(); conn.close()
 
 
-def upsert_merchant(merchant_id: str, legal_name: str | None, website: str | None) -> None:
+def upsert_merchant(merchant_id: str, legal_name: str | None, website: str | None, dba_name: str | None = None) -> None:
 	conn = get_connection()
 	cur = conn.cursor()
 	cur.execute(
-		"INSERT INTO merchants (merchant_id, legal_name, website) VALUES (%s,%s,%s)"
-		" ON DUPLICATE KEY UPDATE legal_name=VALUES(legal_name), website=VALUES(website), updated_at=NOW()",
-		(merchant_id, legal_name, website),
+		"INSERT INTO merchants (merchant_id, legal_name, dba_name, website) VALUES (%s,%s,%s,%s)"
+		" ON DUPLICATE KEY UPDATE legal_name=VALUES(legal_name), dba_name=VALUES(dba_name), website=VALUES(website), updated_at=NOW()",
+		(merchant_id, legal_name, dba_name, website),
 	)
 	conn.commit(); cur.close(); conn.close()
 

@@ -1,0 +1,5 @@
+brand_key,official_names,aliases,official_domains,iata_codes,brand_mcc,country,network,source_url,last_verified_at
+united,"United Airlines;United","UA","united.com;unitedairlines.com","UA",3000,US,,https://www.united.com,
+delta,"Delta Air Lines;Delta","DL","delta.com","DL",3058,US,,https://www.delta.com,
+lufthansa,"Lufthansa;Deutsche Lufthansa","LH","lufthansa.com","LH",3008,DE,,https://www.lufthansa.com,
+

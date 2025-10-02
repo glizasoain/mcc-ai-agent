@@ -62,25 +62,19 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 	def to_url(val: Optional[object]) -> Optional[str]:
 		if not val:
 			return None
-		if isinstance(val, str):
-			s = val.strip()
-			# Prefix scheme if missing
-			if not s.startswith("http://") and not s.startswith("https://"):
-				s = "https://" + s
-			return s
-		return getattr(val, "url", None)
+		s = str(val).strip()
+		if not s.startswith("http://") and not s.startswith("https://"):
+			s = "https://" + s
+		return s
 
-	website_url = (to_url(req.website) if req.website else None) or ""
+	website_url = ""
 	all_websites = []
-	if req.website:
-		u = to_url(req.website)
-		if u:
-			all_websites.append(u)
 	if req.websites:
 		for w in req.websites:
 			u = to_url(w)
 			if u:
 				all_websites.append(u)
+	website_url = (all_websites[0] if all_websites else "")
 
 	# Phase 6: if no websites provided, try a simple guess using merchant_id/DB record
 	if not all_websites:
@@ -109,7 +103,6 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 			"industry": req.profile.industry,
 			"vertical": req.profile.vertical,
 			"country": req.profile.country,
-			"existing_mcc": req.profile.existing_mcc,
 			"avg_ticket": req.profile.avg_ticket,
 			"volume_band": req.profile.volume_band,
 		}
@@ -118,12 +111,12 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		primary = all_websites[0] if all_websites else website_url
 		# Include business registration name from DB if present
 		mer_info = (get_merchant(req.merchant_id) or {})
-		biz_name = mer_info.get("legal_name")
+		biz_name = req.legal_name or mer_info.get("legal_name")
 		# Fetch website summary: try focused crawl first, then single-page fallback
 		website_summary = ""
 		if primary:
 			try:
-				overall, pages = crawl_and_summarize(primary, depth=2, max_pages=25, total_budget_seconds=6.0)
+				overall, pages = crawl_and_summarize(primary, depth=3, max_pages=50, total_budget_seconds=8.0)
 				website_summary = overall or ""
 				if not website_summary:
 					ws = fetch_and_summarize(primary)
@@ -135,7 +128,13 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		prof_with_summary["website_summary"] = website_summary
 		if req.current_mcc:
 			prof_with_summary["current_mcc"] = req.current_mcc
-		crew = run_mcc_recommendation(req.merchant_id, primary, prof_with_summary, req.merchant_description, all_websites, biz_name)
+		# Prepare web pages payload for Web Intelligence agent (if available)
+		pages_payload = []
+		try:
+			pages_payload = ([{"url": getattr(p, "url", ""), "title": getattr(p, "title", ""), "text": getattr(p, "text", "")} for p in (pages or [])])
+		except Exception:
+			pages_payload = []
+		crew = run_mcc_recommendation(req.merchant_id, primary, prof_with_summary, req.merchant_description, all_websites, biz_name, pages_payload)
 		merchant_name = crew.get("merchant_name") or merchant_name
 		rec_mcc = crew.get("recommended_mcc") or rec_mcc
 		confidence = int(crew.get("confidence") or confidence)
@@ -145,6 +144,51 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		model_name = crew.get("model") or "crewai"
 		prompt_hash_val = crew.get("prompt_hash")
 		llm_model_name = crew.get("llm_model")
+		web_intel_obj = crew.get("_web_intel_json")
+		# If deterministic path was taken and website_summary is empty, synthesize from web_intel if present
+		if (not website_summary) and web_intel_obj:
+			try:
+				parts = []
+				co = (web_intel_obj.get("core_offering") or "").strip()
+				sm = (web_intel_obj.get("sales_model") or "").strip()
+				tc = (web_intel_obj.get("target_customers") or "").strip()
+				if co:
+					parts.append(co)
+				if sm:
+					parts.append(sm)
+				if tc:
+					parts.append(f"for {tc}")
+				candidate = "; ".join(parts).strip()
+				if candidate:
+					website_summary = candidate[:400]
+			except Exception:
+				pass
+		# If website_summary is empty or looks like a gate, synthesize a concise summary from web_intel or page titles
+		if not website_summary or "continue shopping" in (website_summary or "").lower():
+			try:
+				if web_intel_obj:
+					parts = []
+					co = (web_intel_obj.get("core_offering") or "").strip()
+					sm = (web_intel_obj.get("sales_model") or "").strip()
+					tc = (web_intel_obj.get("target_customers") or "").strip()
+					if co:
+						parts.append(co)
+					if sm:
+						parts.append(sm)
+					if tc:
+						parts.append(f"for {tc}")
+					candidate = "; ".join(parts).strip()
+					if candidate:
+						website_summary = candidate[:400]
+			except Exception:
+				pass
+			if (not website_summary) and pages:
+				try:
+					website_summary = " | ".join([(getattr(p, "title", None) or getattr(p, "url", "")) for p in (pages[:3])])[:400]
+				except Exception:
+					pass
+		# reflect any updated summary in profile used for response
+		prof_with_summary["website_summary"] = website_summary or prof_with_summary.get("website_summary") or ""
 	except Exception as e:
 		raise HTTPException(status_code=503, detail={"error": "CREW_UNAVAILABLE", "message": str(e)})
 
@@ -168,6 +212,7 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		website_summary=prof_with_summary.get("website_summary") or "",
 		debug_prompt=crew.get("_debug_prompt"),
 		agents_involved=crew.get("_agents") or [],
+		web_intel=web_intel_obj,
 		provenance=Provenance(model=locals().get("model_name"), prompt_hash=locals().get("prompt_hash_val"), mcc_reference_version="catalog:mcc_codes_full.csv", llm_model=locals().get("llm_model_name")),
 	)
 	data = resp.model_dump()
@@ -197,7 +242,7 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		except Exception:
 			pass
 
-	return data
+	return resp
 
 
 # --- Additional Phase 2 stub endpoints ---
@@ -205,7 +250,10 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 @app.post("/api/v1/submit_merchant", response_model=SubmitMerchantResponse)
 def submit_merchant(req: SubmitMerchantRequest):
 	try:
-		upsert_merchant(req.merchant_id, req.merchant_name, (req.website.url if req.website else None))
+		first_site = None
+		if req.websites:
+			first_site = req.websites[0]
+		upsert_merchant(req.merchant_id, req.legal_name or req.merchant_name, first_site, req.dba_name)
 		return {"submitted": True, "merchant_id": req.merchant_id}
 	except Exception:
 		return {"submitted": False, "merchant_id": req.merchant_id}

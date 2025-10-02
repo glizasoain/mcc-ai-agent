@@ -118,19 +118,66 @@ def fetch_and_summarize(url: str, timeout: float = 5.0) -> Dict[str, str]:
 	"""
 	text = ""
 	summary = ""
-	try:
-		with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-			r = client.get(url)
-			if r.status_code >= 200 and r.status_code < 300:
-				soup = BeautifulSoup(r.text, "lxml")
-				# Drop script/style
-				for tag in soup(["script", "style", "noscript"]):
-					tag.extract()
-				text = " ".join((soup.get_text(separator=" ") or "").split())
-				# Simple heuristic summary: first 400 chars
-				summary = text[:400]
-	except Exception:
-		pass
-	return {"content": text, "summary": summary}
+
+	BROWSER_HEADERS = {
+		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"Accept-Language": "en-US,en;q=0.9",
+		"Cache-Control": "no-cache",
+	}
+
+	def is_gate(text_in: str) -> bool:
+		low = (text_in or "").lower()
+		if len(low) < 200:
+			return True
+		gates = (
+			"continue shopping",
+			"conditions of use",
+			"privacy policy",
+			"sign in",
+			"captcha",
+			"enable cookies",
+		)
+		return any(g in low for g in gates)
+
+	def fetch_once(u: str) -> str:
+		try:
+			with httpx.Client(timeout=timeout, follow_redirects=True, headers=BROWSER_HEADERS) as client:
+				r = client.get(u)
+				if r.status_code >= 200 and r.status_code < 300 and r.text:
+					soup = BeautifulSoup(r.text, "lxml")
+					for tag in soup(["script", "style", "noscript"]):
+						tag.extract()
+					# remove common banners
+					for el in soup.find_all(True):
+						cls = " ".join((el.get("class") or []))
+						if any(k in (cls.lower() + " " + (el.get("id") or "").lower()) for k in ("cookie", "consent", "banner", "footer", "header")):
+							try:
+								el.decompose()
+							except Exception:
+								pass
+					return " ".join((soup.get_text(separator=" ") or "").split())
+		except Exception:
+			return ""
+
+	from urllib.parse import urlparse
+	parsed = urlparse(url)
+	candidates = [url]
+	# try www. host
+	if not parsed.netloc.startswith("www."):
+		candidates.append(f"{parsed.scheme}://www.{parsed.netloc}{parsed.path or '/'}")
+	# try informative paths on root
+	root = f"{parsed.scheme}://{parsed.netloc}"
+	for suffix in ("/about", "/company", "/help", "/gp/help/customer/display.html"):
+		candidates.append(root + suffix)
+
+	for cand in candidates:
+		text = fetch_once(cand)
+		if text and not is_gate(text):
+			summary = text[:400]
+			return {"content": text, "summary": summary}
+
+	# If all attempts look like gates, return empty rather than misleading text
+	return {"content": "", "summary": ""}
 
 

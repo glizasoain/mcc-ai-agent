@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -11,21 +11,18 @@ class Profile(BaseModel):
 	industry: Optional[str] = None
 	vertical: Optional[str] = None
 	country: Optional[str] = None
-	existing_mcc: Optional[str] = None
 	avg_ticket: Optional[float] = None
 	volume_band: Optional[str] = None
-
-
-WebsiteInput = Union[str, Website]
 
 
 class RecommendRequest(BaseModel):
 	merchant_id: str
 	current_mcc: Optional[str] = None
 	profile: Optional[Profile] = None
-	website: Optional[WebsiteInput] = None
-	websites: Optional[List[WebsiteInput]] = None
+	websites: Optional[List[str]] = None
 	merchant_description: Optional[str] = None
+	legal_name: Optional[str] = None
+	dba_name: Optional[str] = None
 	force: Optional[bool] = False
 
 
@@ -52,6 +49,7 @@ class RecommendResponse(BaseModel):
 	website_summary: Optional[str] = ""
 	debug_prompt: Optional[str] = None
 	agents_involved: Optional[List[str]] = []
+	web_intel: Optional[Dict[str, Any]] = None
 	provenance: Provenance
 
 
@@ -59,7 +57,9 @@ class RecommendResponse(BaseModel):
 class SubmitMerchantRequest(BaseModel):
 	merchant_id: str
 	merchant_name: str
-	website: Optional[Website] = None
+	legal_name: Optional[str] = None
+	dba_name: Optional[str] = None
+	websites: Optional[List[str]] = None
 	profile: Optional[Profile] = None
 
 
