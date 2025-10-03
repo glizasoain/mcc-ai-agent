@@ -532,6 +532,57 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			except Exception:
 				pass
 
+			# Compute deltas vs current_mcc when available
+			try:
+				current_mcc_val = prof.get("current_mcc") if isinstance(prof, dict) else None
+				base = get_portfolio_row(str(current_mcc_val)) if current_mcc_val else None
+				base_ic = (base or {}).get("weighted_avg_ic_rate")
+				base_decl = (base or {}).get("decline_rate_pct")
+				for item in (top_k or []):
+					cand_ic = item.get("weighted_avg_ic_rate")
+					cand_decl = item.get("decline_rate_pct")
+					if base_ic is not None and cand_ic is not None:
+						item["ic_bps_delta"] = (float(cand_ic) - float(base_ic)) * 10000.0
+					if base_decl is not None and cand_decl is not None:
+						item["decline_pp_delta"] = float(cand_decl) - float(base_decl)
+			except Exception:
+				pass
+
+			# Build MCP proposal ranked list
+			mcp_ranked = []
+			try:
+				for item in (top_k or []):
+					m = {
+						"mcc": item.get("mcc"),
+						"description": get_mcc_description(item.get("mcc") or ""),
+						"rationale": "Preferred due to evidence and signals; see justification.",
+						"confidence": int(item.get("confidence") or 0),
+						"benchmark": {
+							"cohort_ref": item.get("cohort_ref"),
+							"cohort_source": item.get("cohort_source"),
+							"average_ic_rate": item.get("weighted_avg_ic_rate"),
+							"average_decline_rate_pct": item.get("decline_rate_pct"),
+						},
+					}
+					# attach optimization deltas when present
+					if "ic_bps_delta" in item:
+						m["ic_bps_delta"] = item["ic_bps_delta"]
+					if "decline_pp_delta" in item:
+						m["decline_pp_delta"] = item["decline_pp_delta"]
+					mcp_ranked.append(m)
+				# sort by confidence desc primarily, then by lower IC delta and lower decline delta
+				mcp_ranked.sort(key=lambda x: (
+					-(int(x.get("confidence") or 0)),
+					abs(float(x.get("ic_bps_delta", 0.0))),
+					abs(float(x.get("decline_pp_delta", 0.0))),
+				))
+				# refine rationale for chosen MCC to reflect decision justification
+				for m in mcp_ranked:
+					if str(m.get("mcc")) == str(parsed.get("recommended_mcc")):
+						m["rationale"] = parsed.get("justification") or m.get("rationale")
+			except Exception:
+				pass
+
 			# Attach top_k to provenance for visibility
 			try:
 				parsed["_top_k"] = top_k
@@ -558,6 +609,11 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 					llm_model = os.getenv("OPENAI_MODEL")
 				if llm_model:
 					parsed["llm_model"] = llm_model
+			except Exception:
+				pass
+			# expose MCP proposal
+			try:
+				parsed["_mcp_proposal"] = {"ranked": mcp_ranked}
 			except Exception:
 				pass
 			return parsed
