@@ -7,7 +7,7 @@ import re
 import hashlib
 from crewai import Agent, Task, Crew
 from urllib.parse import urlparse
-from app.db import get_mcc_description, get_brand_override, list_all_mcc_codes
+from app.db import get_mcc_description, get_brand_override, list_all_mcc_codes, get_portfolio_row
 from app.rag import ensure_mcc_embeddings_built, retrieve_mcc_candidates
 from app.signals import compute_signals, infer_brand
 from app.db import load_brand_registry
@@ -448,6 +448,16 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			res_dec = decision_crew.kickoff()
 			text_dec: str = getattr(res_dec, "raw", None) or getattr(res_dec, "output", None) or str(res_dec)
 			parsed = normalize_and_validate(text_dec)
+			# Build top_k from shortlist with simple scores (if selector bypassed, approximate)
+			top_k = []
+			try:
+				for code in shortlist[:3]:
+					item = {"mcc": code, "confidence": 60}
+					if code == parsed.get("recommended_mcc"):
+						item["confidence"] = parsed.get("confidence") or 85
+					top_k.append(item)
+			except Exception:
+				pass
 			# Enforce shortlist membership if provided
 			if shortlist and parsed.get("recommended_mcc") not in shortlist:
 				raise RuntimeError("Decision selected MCC outside shortlist")
@@ -510,6 +520,28 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 					parsed["_web_intel_json"] = json.loads(intel_json_for_debug)
 				except Exception:
 					parsed["_web_intel_json"] = None
+			# Enrich top_k with IC/decline benchmarks when available
+			try:
+				for item in (top_k or []):
+					row = get_portfolio_row(item.get("mcc"))
+					if row:
+						item["weighted_avg_ic_rate"] = row.get("weighted_avg_ic_rate")
+						item["decline_rate_pct"] = row.get("decline_rate_pct")
+						item["cohort_ref"] = f"portfolio:mcc:{item.get('mcc')}"
+						item["cohort_source"] = "mcc_portfolio"
+			except Exception:
+				pass
+
+			# Attach top_k to provenance for visibility
+			try:
+				parsed["_top_k"] = top_k
+			except Exception:
+				pass
+			# Add benchmark source tag
+			try:
+				parsed["_benchmark_source"] = {"source": "mcc_portfolio"}
+			except Exception:
+				pass
 			# Add brand inference to provenance
 			try:
 				parsed["_brand"] = {

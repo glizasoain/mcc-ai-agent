@@ -147,6 +147,26 @@ def get_mcc_description(mcc_code: str) -> str:
 		return ""
 
 
+def get_portfolio_row(mcc_code: str) -> dict | None:
+	"""Fetch portfolio IC/decline benchmarks for an MCC code."""
+	try:
+		conn = get_connection()
+		cur = conn.cursor()
+		cur.execute("SELECT mcc_code, mcc_description, weighted_avg_ic_rate, decline_rate_pct FROM mcc_portfolio WHERE mcc_code=%s LIMIT 1", (mcc_code,))
+		row = cur.fetchone()
+		cur.close(); conn.close()
+		if not row:
+			return None
+		return {
+			"mcc_code": row[0],
+			"mcc_description": row[1],
+			"weighted_avg_ic_rate": float(row[2]) if row[2] is not None else None,
+			"decline_rate_pct": float(row[3]) if row[3] is not None else None,
+		}
+	except Exception:
+		return None
+
+
 def list_all_mcc_codes() -> list[tuple[str, str]]:
 	"""Return list of (mcc_code, description)."""
 	try:
