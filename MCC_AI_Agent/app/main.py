@@ -213,8 +213,8 @@ def recommend(req: RecommendRequest, idempotency_key: Optional[str] = Header(def
 		debug_prompt=crew.get("_debug_prompt"),
 		agents_involved=crew.get("_agents") or [],
 		web_intel=web_intel_obj,
-		top_k=crew.get("_top_k"),
-		mcp_proposal=crew.get("_mcp_proposal"),
+		mcc_proposal=crew.get("_mcp_proposal"),
+		business_description=crew.get("_business_model"),
 		provenance=Provenance(model=locals().get("model_name"), prompt_hash=locals().get("prompt_hash_val"), mcc_reference_version="catalog:mcc_codes_full.csv", llm_model=locals().get("llm_model_name")),
 	)
 	data = resp.model_dump()

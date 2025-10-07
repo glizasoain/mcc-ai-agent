@@ -17,6 +17,7 @@ def compute_signals(intel: Dict[str, Any]) -> Dict[str, Any]:
         "retail": 0,
         "saas": 0,
         "services": 0,
+        "direct_marketing": 0,
     }
     fired: List[Dict[str, str]] = []
 
@@ -45,9 +46,14 @@ def compute_signals(intel: Dict[str, Any]) -> Dict[str, Any]:
     for token in ["marketplace", "sellers", "sell on", "vendor portal", "seller center"]:
         if token in quotes:
             hit("marketplace", f"text:{token}")
-    for token in ["add to cart", "buy now", "returns", "shipping"]:
+    for token in ["add to cart", "buy now", "returns", "shipping", "shop", "store", "checkout", "cart", "trade-in", "buy"]:
         if token in quotes:
             hit("retail", f"text:{token}")
+
+    # Direct marketing / MLM cues
+    for token in ["mlm", "multi-level marketing", "multi level marketing", "direct selling", "party plan", "catalog", "independent consultant", "distributor"]:
+        if token in quotes:
+            hit("direct_marketing", f"text:{token}")
 
     # SaaS vs Services
     for token in ["pricing", "plan", "per month", "api", "docs", "developer"]:

@@ -50,8 +50,8 @@ class RecommendResponse(BaseModel):
 	debug_prompt: Optional[str] = None
 	agents_involved: Optional[List[str]] = []
 	web_intel: Optional[Dict[str, Any]] = None
-	top_k: Optional[List[Dict[str, Any]]] = None
-	mcp_proposal: Optional[Dict[str, Any]] = None
+	mcc_proposal: Optional[Dict[str, Any]] = None
+	business_description: Optional[Dict[str, Any]] = None
 	provenance: Provenance
 
 

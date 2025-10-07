@@ -7,7 +7,7 @@ import re
 import hashlib
 from crewai import Agent, Task, Crew
 from urllib.parse import urlparse
-from app.db import get_mcc_description, get_brand_override, list_all_mcc_codes, get_portfolio_row
+from app.db import get_mcc_description, get_brand_override, list_all_mcc_codes, get_portfolio_row, get_ic_optimization_metrics
 from app.rag import ensure_mcc_embeddings_built, retrieve_mcc_candidates
 from app.signals import compute_signals, infer_brand
 from app.db import load_brand_registry
@@ -62,6 +62,18 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 		backstory=(
 			"You analyze merchant websites to identify their core revenue-generating activity. "
 			"You never fabricate. Cite short quotes with URLs when possible."
+		),
+		allow_delegation=False,
+		verbose=False,
+	)
+
+	business_model_analyst = Agent(
+		role="Business Model Analyst",
+		goal=(
+			"Summarize the merchant's business model into normalized fields for MCC decision-making."
+		),
+		backstory=(
+			"You read web intelligence, brand inference, and basic KPIs to identify core revenue, channels, MoR, flows, and monetization."
 		),
 		allow_delegation=False,
 		verbose=False,
@@ -192,6 +204,25 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 		agent=intel_analyst,
 	)
 
+	# Step 0.5: Business Model summary task
+	# Ensure intel_json_for_debug has a default before first use
+	intel_json_for_debug = "{}"
+	model_summary_prompt = (
+		"You are the Business Model Analyst. Produce a normalized JSON summary.\n"
+		"Return STRICT JSON with keys: core_revenue_stream, primary_offering, channels(array), merchant_of_record, transaction_flows(array), "
+		"monetization(array), target_customers(array), regulated_flags(array), brand_match(obj), key_evidence(array).\n\n"
+		f"legal_name: {business_registration_name or ''}\n"
+		f"web_intel: {(intel_json_for_debug or '{}')}\n"
+		"Respond ONLY with the JSON object."
+	)
+	model_task = Task(
+		description=model_summary_prompt,
+		expected_output=(
+			"Strict JSON with keys: core_revenue_stream, primary_offering, channels, merchant_of_record, transaction_flows, monetization, target_customers, regulated_flags, brand_match, key_evidence."
+		),
+		agent=business_model_analyst,
+	)
+
 	classify_task = Task(
 		description=prompt,
 		expected_output=(
@@ -270,6 +301,17 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			except Exception:
 				intel_json_for_debug = "{}"
 
+			# Business model summary
+			model_crew = Crew(agents=[business_model_analyst], tasks=[model_task])
+			res_model = model_crew.kickoff()
+			model_text: str = getattr(res_model, "raw", None) or getattr(res_model, "output", None) or str(res_model)
+			model_json: dict | None = None
+			try:
+				start_m = model_text.find("{"); end_m = model_text.rfind("}")
+				model_json = json.loads(model_text[start_m:end_m+1]) if start_m != -1 and end_m != -1 else None
+			except Exception:
+				model_json = None
+
 			# Deterministic airline vs agency disambiguator from intel JSON
 			rule_hint = ""
 			candidate_codes: List[str] = []
@@ -277,6 +319,17 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 				intel_obj = json.loads(intel_json_for_debug or "{}")
 				is_airline = bool(intel_obj.get("is_first_party_airline"))
 				is_agency = bool(intel_obj.get("is_travel_agency"))
+				# If business model summary exists, prefer its MoR/channel cues
+				try:
+					if model_json:
+						mor = (model_json.get("merchant_of_record") or "").lower()
+						channels = [str(c).lower() for c in (model_json.get("channels") or [])]
+						if mor == "first_party":
+							is_airline = is_airline or ("airline" in (model_json.get("primary_offering") or "").lower())
+						if "marketplace" in channels:
+							is_agency = True
+				except Exception:
+					pass
 				key_pages = intel_obj.get("key_pages") or []
 				evidence = intel_obj.get("evidence") or []
 				text_blobs = " ".join([str((e or {}).get("quote") or "") for e in evidence])
@@ -509,7 +562,7 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			parsed["model"] = "crewai"
 			parsed["prompt_hash"] = combined_hash
 			parsed["_debug_prompt"] = prompt
-			parsed["_agents"] = ["Web Intelligence Analyst"] + ([] if bypass_selector else ["Candidate Selector"]) + ["MCC Decision Analyst", "MCC Review Analyst"]
+			parsed["_agents"] = ["Web Intelligence Analyst", "Business Model Analyst"] + ([] if bypass_selector else ["Candidate Selector"]) + ["MCC Decision Analyst", "MCC Review Analyst"]
 			try:
 				if 'parsed_signals_json' in locals():
 					parsed["_signals"] = json.loads(parsed_signals_json)
@@ -520,15 +573,35 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 					parsed["_web_intel_json"] = json.loads(intel_json_for_debug)
 				except Exception:
 					parsed["_web_intel_json"] = None
-			# Enrich top_k with IC/decline benchmarks when available
+			# Enrich top_k with IC/decline benchmarks when available (portfolio and ic_optimization)
 			try:
 				for item in (top_k or []):
-					row = get_portfolio_row(item.get("mcc"))
+					mcc_code = item.get("mcc")
+					row = get_portfolio_row(mcc_code)
 					if row:
 						item["weighted_avg_ic_rate"] = row.get("weighted_avg_ic_rate")
 						item["decline_rate_pct"] = row.get("decline_rate_pct")
-						item["cohort_ref"] = f"portfolio:mcc:{item.get('mcc')}"
+						item["cohort_ref"] = f"portfolio:mcc:{mcc_code}"
 						item["cohort_source"] = "mcc_portfolio"
+					else:
+						opt = get_ic_optimization_metrics(mcc_code)
+						if opt:
+							item["weighted_avg_ic_rate"] = opt.get("avg_ic_rate")
+							item["decline_rate_pct"] = opt.get("decline_rate_pct")
+							item["cohort_ref"] = f"ic_opt:mcc:{mcc_code}"
+							item["cohort_source"] = "ic_optimization"
+			except Exception:
+				pass
+
+			# Ensure final choice is included in shortlist/top_k (rank 1)
+			try:
+				final_code = str(parsed.get("recommended_mcc") or "")
+				if final_code and final_code not in (shortlist or []):
+					shortlist = [final_code] + (shortlist or [])
+				if final_code and (top_k is not None):
+					present = any(str(i.get("mcc")) == final_code for i in top_k)
+					if not present:
+						top_k = [{"mcc": final_code, "confidence": parsed.get("confidence") or 85}] + top_k
 			except Exception:
 				pass
 
@@ -562,8 +635,18 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 							"cohort_source": item.get("cohort_source"),
 							"average_ic_rate": item.get("weighted_avg_ic_rate"),
 							"average_decline_rate_pct": item.get("decline_rate_pct"),
+							"example_merchant_name": None,
+							"example_merchant_url": None,
 						},
 					}
+					# if portfolio row included examples, add them
+					try:
+						row = get_portfolio_row(item.get("mcc"))
+						if row:
+							m["benchmark"]["example_merchant_name"] = row.get("example_merchant_name")
+							m["benchmark"]["example_merchant_url"] = row.get("example_merchant_url")
+					except Exception:
+						pass
 					# attach optimization deltas when present
 					if "ic_bps_delta" in item:
 						m["ic_bps_delta"] = item["ic_bps_delta"]
@@ -583,11 +666,7 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			except Exception:
 				pass
 
-			# Attach top_k to provenance for visibility
-			try:
-				parsed["_top_k"] = top_k
-			except Exception:
-				pass
+			# no longer expose top_k; mcc_proposal carries ranked entries
 			# Add benchmark source tag
 			try:
 				parsed["_benchmark_source"] = {"source": "mcc_portfolio"}
@@ -614,6 +693,11 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			# expose MCP proposal
 			try:
 				parsed["_mcp_proposal"] = {"ranked": mcp_ranked}
+			except Exception:
+				pass
+			# expose business model summary
+			try:
+				parsed["_business_model"] = model_json
 			except Exception:
 				pass
 			return parsed

@@ -44,7 +44,20 @@ def run_migrations():
 		with sql_file.open("r", encoding="utf-8") as f:
 			sql = f.read()
 		for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
-			cur.execute(stmt)
+			try:
+				cur.execute(stmt)
+				# Consume any result sets to avoid "Unread result found" between statements
+				try:
+					if getattr(cur, "with_rows", False):
+						cur.fetchall()
+				except Exception:
+					pass
+			except mysql.connector.Error as e:
+				msg = str(e)
+				# Ignore safe, idempotent errors (e.g., duplicate column/table when re-running)
+				if e.errno in (1060, 1050) or "Duplicate column name" in msg or "already exists" in msg:
+					continue
+				raise
 	conn.commit()
 	cur.close()
 	conn.close()
@@ -152,7 +165,7 @@ def get_portfolio_row(mcc_code: str) -> dict | None:
 	try:
 		conn = get_connection()
 		cur = conn.cursor()
-		cur.execute("SELECT mcc_code, mcc_description, weighted_avg_ic_rate, decline_rate_pct FROM mcc_portfolio WHERE mcc_code=%s LIMIT 1", (mcc_code,))
+		cur.execute("SELECT mcc_code, mcc_description, weighted_avg_ic_rate, decline_rate_pct, example_merchant_name, example_merchant_url FROM mcc_portfolio WHERE mcc_code=%s LIMIT 1", (mcc_code,))
 		row = cur.fetchone()
 		cur.close(); conn.close()
 		if not row:
@@ -162,7 +175,130 @@ def get_portfolio_row(mcc_code: str) -> dict | None:
 			"mcc_description": row[1],
 			"weighted_avg_ic_rate": float(row[2]) if row[2] is not None else None,
 			"decline_rate_pct": float(row[3]) if row[3] is not None else None,
+			"example_merchant_name": (row[4] or None),
+			"example_merchant_url": (row[5] or None),
 		}
+	except Exception:
+		return None
+
+
+def get_ic_optimization_metrics(mcc_code: str) -> dict | None:
+	"""Fetch average effective IC rate and approximate decline rate from ic_optimization schema.
+
+	Returns dict with keys: avg_ic_rate (float|None), decline_rate_pct (float|None)
+	"""
+	try:
+		conn = get_connection(include_database=False)
+		cur = conn.cursor()
+		# Use CAST on varchar fields; treat 'declin' in Status/Auth as decline indicator
+		cur.execute(
+			"""
+			SELECT 
+			  AVG(CASE WHEN NULLIF(txt_effective_ic_rate,'') IS NOT NULL THEN CAST(txt_effective_ic_rate AS DECIMAL(10,6)) END) AS avg_ic_rate,
+			  AVG(CASE WHEN LOWER(COALESCE(txt_Status,'')) LIKE '%declin%' OR LOWER(COALESCE(txt_Auth,'')) LIKE '%declin%' THEN 1 ELSE 0 END) AS decline_rate
+			FROM ic_optimization.backup_transactions_full_profile
+			WHERE txt_mccCode = %s
+			""",
+			(mcc_code,),
+		)
+		row = cur.fetchone()
+		cur.close(); conn.close()
+		if not row:
+			return None
+		avg_ic = float(row[0]) if row and row[0] is not None else None
+		decl_rate_pct = float(row[1]) * 100.0 if row and row[1] is not None else None
+		return {"avg_ic_rate": avg_ic, "decline_rate_pct": decl_rate_pct}
+	except Exception:
+		return None
+
+
+def get_merchant_kpis_aggregates(merchant_id: str) -> dict | None:
+	"""Return average volume_usd and avg_ticket_usd for the merchant (if available)."""
+	try:
+		conn = get_connection()
+		cur = conn.cursor()
+		cur.execute(
+			"SELECT AVG(volume_usd), AVG(avg_ticket_usd) FROM merchant_kpis_monthly WHERE merchant_id=%s",
+			(merchant_id,),
+		)
+		row = cur.fetchone()
+		cur.close(); conn.close()
+		if not row:
+			return None
+		avg_vol = float(row[0]) if row and row[0] is not None else None
+		avg_ticket = float(row[1]) if row and row[1] is not None else None
+		return {"avg_volume_usd": avg_vol, "avg_ticket_usd": avg_ticket}
+	except Exception:
+		return None
+
+
+def compute_bands(avg_volume_usd: float | None, avg_ticket_usd: float | None) -> dict:
+	"""Compute coarse bands for volume and average ticket.
+
+	volume_band: small(<50k), mid(50k-500k), large(>500k)
+	ticket_band: low(<20), mid(20-200), high(>200)
+	"""
+	vol_band = None
+	if avg_volume_usd is not None:
+		if avg_volume_usd < 50_000:
+			vol_band = "small"
+		elif avg_volume_usd <= 500_000:
+			vol_band = "mid"
+		else:
+			vol_band = "large"
+
+	tkt_band = None
+	if avg_ticket_usd is not None:
+		if avg_ticket_usd < 20:
+			tkt_band = "low"
+		elif avg_ticket_usd <= 200:
+			tkt_band = "mid"
+		else:
+			tkt_band = "high"
+
+	return {"volume_band": vol_band, "ticket_band": tkt_band}
+
+
+def get_ic_optimization_metrics_band(mcc_code: str, volume_band: str | None, ticket_band: str | None) -> dict | None:
+	"""Fetch metrics from ic_optimization with optional band filters (approximate via varchar casts)."""
+	try:
+		conn = get_connection(include_database=False)
+		cur = conn.cursor()
+		conds = ["txt_mccCode = %s"]
+		params: list = [mcc_code]
+		# derive numeric ranges for bands based on txt_Monthly_Volume and txt_Average_Ticket
+		if volume_band:
+			if volume_band == "small":
+				conds.append("CAST(NULLIF(txt_Monthly_Volume,'') AS DECIMAL(18,2)) < 50000")
+			elif volume_band == "mid":
+				conds.append("CAST(NULLIF(txt_Monthly_Volume,'') AS DECIMAL(18,2)) BETWEEN 50000 AND 500000")
+			elif volume_band == "large":
+				conds.append("CAST(NULLIF(txt_Monthly_Volume,'') AS DECIMAL(18,2)) > 500000")
+		if ticket_band:
+			if ticket_band == "low":
+				conds.append("CAST(NULLIF(txt_Average_Ticket,'') AS DECIMAL(18,2)) < 20")
+			elif ticket_band == "mid":
+				conds.append("CAST(NULLIF(txt_Average_Ticket,'') AS DECIMAL(18,2)) BETWEEN 20 AND 200")
+			elif ticket_band == "high":
+				conds.append("CAST(NULLIF(txt_Average_Ticket,'') AS DECIMAL(18,2)) > 200")
+		where = " AND ".join(conds)
+		cur.execute(
+			f"""
+			SELECT 
+			  AVG(CASE WHEN NULLIF(txt_effective_ic_rate,'') IS NOT NULL THEN CAST(txt_effective_ic_rate AS DECIMAL(10,6)) END) AS avg_ic_rate,
+			  AVG(CASE WHEN LOWER(COALESCE(txt_Status,'')) LIKE '%declin%' OR LOWER(COALESCE(txt_Auth,'')) LIKE '%declin%' THEN 1 ELSE 0 END) AS decline_rate
+			FROM ic_optimization.backup_transactions_full_profile
+			WHERE {where}
+			""",
+			params,
+		)
+		row = cur.fetchone()
+		cur.close(); conn.close()
+		if not row:
+			return None
+		avg_ic = float(row[0]) if row and row[0] is not None else None
+		decl_rate_pct = float(row[1]) * 100.0 if row and row[1] is not None else None
+		return {"avg_ic_rate": avg_ic, "decline_rate_pct": decl_rate_pct}
 	except Exception:
 		return None
 
