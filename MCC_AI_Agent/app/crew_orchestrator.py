@@ -7,7 +7,16 @@ import re
 import hashlib
 from crewai import Agent, Task, Crew
 from urllib.parse import urlparse
-from app.db import get_mcc_description, get_brand_override, list_all_mcc_codes, get_portfolio_row, get_ic_optimization_metrics
+from app.db import (
+    get_mcc_description,
+    get_brand_override,
+    list_all_mcc_codes,
+    get_portfolio_row,
+    get_ic_optimization_metrics,
+    get_merchant_kpis_aggregates,
+    compute_bands,
+    get_ic_optimization_metrics_band,
+)
 from app.rag import ensure_mcc_embeddings_built, retrieve_mcc_candidates
 from app.signals import compute_signals, infer_brand
 from app.db import load_brand_registry
@@ -605,15 +614,38 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 			except Exception:
 				pass
 
-			# Compute deltas vs current_mcc when available
+			# Compute deltas vs current_mcc using portfolio, and enrich with ic_optimization metrics (optionally banded by merchant KPIs)
 			try:
 				current_mcc_val = prof.get("current_mcc") if isinstance(prof, dict) else None
+				# baseline from portfolio
 				base = get_portfolio_row(str(current_mcc_val)) if current_mcc_val else None
 				base_ic = (base or {}).get("weighted_avg_ic_rate")
 				base_decl = (base or {}).get("decline_rate_pct")
+				# merchant KPI bands
+				merchant_kpis = get_merchant_kpis_aggregates(merchant_id)
+				bands = compute_bands((merchant_kpis or {}).get("avg_volume_usd"), (merchant_kpis or {}).get("avg_ticket_usd")) if merchant_kpis else {"volume_band": None, "ticket_band": None}
 				for item in (top_k or []):
+					# portfolio metrics already present in item
 					cand_ic = item.get("weighted_avg_ic_rate")
 					cand_decl = item.get("decline_rate_pct")
+					# add ic_optimization observed metrics (global)
+					try:
+						obs = get_ic_optimization_metrics(item.get("mcc"))
+						if obs:
+							item["obs_avg_ic_rate"] = obs.get("avg_ic_rate")
+							item["obs_decline_rate_pct"] = obs.get("decline_rate_pct")
+					except Exception:
+						pass
+					# banded metrics when bands available
+					try:
+						if bands.get("volume_band") or bands.get("ticket_band"):
+							bobs = get_ic_optimization_metrics_band(item.get("mcc"), bands.get("volume_band"), bands.get("ticket_band"))
+							if bobs:
+								item["band_avg_ic_rate"] = bobs.get("avg_ic_rate")
+								item["band_decline_rate_pct"] = bobs.get("decline_rate_pct")
+					except Exception:
+						pass
+					# compute deltas vs base
 					if base_ic is not None and cand_ic is not None:
 						item["ic_bps_delta"] = (float(cand_ic) - float(base_ic)) * 10000.0
 					if base_decl is not None and cand_decl is not None:
@@ -653,7 +685,7 @@ def run_mcc_recommendation(merchant_id: str, website_url: Optional[str], profile
 					if "decline_pp_delta" in item:
 						m["decline_pp_delta"] = item["decline_pp_delta"]
 					mcp_ranked.append(m)
-				# sort by confidence desc primarily, then by lower IC delta and lower decline delta
+				# sort by confidence desc, then by lower IC delta and lower decline delta
 				mcp_ranked.sort(key=lambda x: (
 					-(int(x.get("confidence") or 0)),
 					abs(float(x.get("ic_bps_delta", 0.0))),

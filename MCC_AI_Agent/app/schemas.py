@@ -106,3 +106,19 @@ class IngestProfileRequest(BaseModel):
 class IngestProfileResponse(BaseModel):
 	merchant_id: str
 	ingested: bool
+
+
+class ChatMessage(BaseModel):
+	role: str
+	content: str
+
+
+class ChatRequest(BaseModel):
+	merchant_id: Optional[str] = None
+	messages: List[ChatMessage]
+	context: Optional[Dict[str, Any]] = None
+
+
+class ChatResponse(BaseModel):
+	messages: List[ChatMessage]
+	context_used: Optional[Dict[str, Any]] = None

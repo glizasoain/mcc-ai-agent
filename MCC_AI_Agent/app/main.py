@@ -2,6 +2,7 @@ from fastapi import FastAPI, Header, HTTPException
 from typing import Optional
 from dotenv import load_dotenv
 from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.schemas import (
 	RecommendRequest, RecommendResponse, Provenance,
@@ -10,6 +11,7 @@ from app.schemas import (
 	SimulateImpactRequest, SimulateImpactResponse,
 	ListRunsResponse, GetRunResponse,
 	IngestProfileRequest, IngestProfileResponse,
+	ChatRequest, ChatResponse, ChatMessage,
 )
 from app.db import (
 	init_database, get_mcc_description,
@@ -22,11 +24,19 @@ from app.crew_orchestrator import run_mcc_recommendation
 from app.impact import simulate_impact as simulate_impact_calc
 from app.impact import fetch_and_summarize
 from app.web import crawl_and_summarize
+from app.llm import call_llm_chat
 
 # Load .env if present
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 app = FastAPI(title="MCC AI Agent", version="0.1.0")
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+	allow_credentials=True,
+	allow_methods=["*"],
+	allow_headers=["*"],
+)
 
 # Initialize DB at startup
 @app.on_event("startup")
@@ -308,3 +318,95 @@ def get_run(run_id: str):
 def ingest_profile(req: IngestProfileRequest):
 	# Phase 6 placeholder for web artifacts ingestion; accept and store raw content if provided later
 	return {"merchant_id": req.merchant_id, "ingested": True}
+
+
+@app.post("/api/v1/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+	last = next((m for m in reversed(req.messages) if m.role == "user"), None)
+	ctx = req.context or {}
+	# Opportunistic enrichment: if the question asks about the website and we lack a summary, try to fetch one quickly
+	try:
+		qtext = (last.content.lower() if last and last.content else "")
+		needs_ws = ("website" in qtext or "more" in qtext or "about" in qtext)
+		if needs_ws and not (ctx.get("website_summary") or "").strip():
+			cand_url = None
+			se = ctx.get("supporting_evidence")
+			if isinstance(se, str) and se.strip():
+				cand_url = se.strip()
+			elif isinstance(ctx.get("websites"), list) and ctx["websites"]:
+				cand_url = str(ctx["websites"][0]).strip()
+			if cand_url:
+				try:
+					# keep it fast; prefer single-page summary first
+					ws = fetch_and_summarize(cand_url, timeout=5.0)
+					if isinstance(ws, dict) and (ws.get("summary") or "").strip():
+						ctx["website_summary"] = ws.get("summary")
+				except Exception:
+					pass
+	except Exception:
+		pass
+	# Try LLM-backed chat first
+	try:
+		answer = call_llm_chat(ctx, [m.model_dump() for m in req.messages])
+		if answer:
+			reply = ChatMessage(role="assistant", content=answer)
+			return ChatResponse(messages=req.messages + [reply], context_used=ctx)
+	except Exception:
+		pass
+	# Fallback deterministic formatter
+	intel = ctx.get("web_intel") or {}
+	ws = ctx.get("website_summary") or ""
+	mcp = ctx.get("mcc_proposal") or {}
+	just = (ctx.get("justification") or "").strip()
+	rec_mcc = (ctx.get("recommended_mcc") or "").strip()
+	rec_desc = (ctx.get("recommended_mcc_description") or "").strip()
+	confidence = ctx.get("confidence")
+	ranked = (mcp.get("ranked") or [])
+	text = None
+	q = (last.content.lower() if last and last.content else "")
+	if any(w in q for w in ("why", "reason", "because", "suggest")):
+		parts = []
+		if ranked:
+			lead = ranked[0]
+			r = (lead.get("rationale") or "").strip()
+			if r:
+				parts.append(r)
+		if not parts and just:
+			parts.append(just)
+		if confidence is not None or rec_mcc or rec_desc:
+			label = f"{rec_mcc} — {rec_desc}".strip(" —") if rec_mcc or rec_desc else None
+			if label:
+				parts.append(f"Chosen MCC: {label}")
+			if isinstance(confidence, int):
+				parts.append(f"Confidence: {confidence}")
+		if len(ranked) > 1:
+			ru = ranked[1]
+			parts.append(f"Runner‑up: {ru.get('mcc')} — {ru.get('description')}")
+		ev = intel.get("evidence") or []
+		if ev:
+			try:
+				q1 = (ev[0].get("quote") or ev[0].get("url") or "").strip()
+				if q1:
+					parts.append(f"Evidence: {q1}")
+			except Exception:
+				pass
+		text = "; ".join([p for p in parts if p]) or None
+	if not text:
+		bits = []
+		co = (intel.get("core_offering") or "").strip()
+		prs = (intel.get("primary_revenue_stream") or "").strip()
+		tc = (intel.get("target_customers") or "").strip()
+		if co:
+			bits.append(co)
+		if prs:
+			bits.append(prs)
+		if tc:
+			bits.append(f"for {tc}")
+		if not bits and ws:
+			bits.append(ws[:200])
+		if ranked:
+			lead = ranked[0]
+			bits.append(f"Top MCC {lead.get('mcc')} — {lead.get('description')}")
+		text = "; ".join([b for b in bits if b]) or (last.content if last else "Hello")
+	reply = ChatMessage(role="assistant", content=text)
+	return ChatResponse(messages=req.messages + [reply], context_used=ctx)
